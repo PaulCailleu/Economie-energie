@@ -7,9 +7,20 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+
+default_colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
+
+plt.rcParams.update({
+    "text.usetex": True,         # Utiliser LaTeX pour le rendu des textes
+    "font.family": "serif",      # Utiliser une police de caractères avec empattement (serif)
+    "font.size" : "18",
+    "legend.fontsize": 10,
+    #"text.latex.preamble": r'\usepackage{bm}'
+})
 
 
 SCENARIO_COLS = {"Ref case": 8, "Case 1": 9, "Case 2": 10}
@@ -72,10 +83,48 @@ def dispatch_min_cost(
     return dispatch
 
 
+def _ensure_interactive_backend() -> None:
+    """If current backend is non-interactive (e.g., Agg), try to switch to an interactive one."""
+    backend = matplotlib.get_backend().lower()
+    if "agg" in backend:
+        for candidate in ("TkAgg", "MacOSX", "Qt5Agg"):
+            try:
+                plt.switch_backend(candidate)
+                return
+            except Exception:
+                continue
+
+
+def plot_profile(
+    data: pd.DataFrame, capacities: dict, scenario: str, output: Path, show: bool
+) -> None:
+    """Plot raw load and available solar/wind profiles to visualize resource shapes."""
+    if show:
+        _ensure_interactive_backend()
+    solar_avail = capacities["solar"] * data["solar_cf"]
+    wind_avail = capacities["wind"] * data["wind_cf"]
+
+    fig, ax = plt.subplots(figsize=(12, 4))
+    ax.plot(data["time"], data["load"], color="black", linewidth=1.0, label="Demande brute")
+    ax.plot(data["time"], solar_avail, color="#f6c344", linewidth=0.8, label="Solar dispo")
+    ax.plot(data["time"], wind_avail, color="#4e79a7", linewidth=0.8, label="Wind dispo")
+    ax.set_title(f"Profils bruts (load et ressources) - {scenario}")
+    ax.set_ylabel("Puissance (MW)")
+    ax.margins(x=0)
+    ax.legend(loc="upper right")
+    fig.tight_layout()
+    fig.savefig(output, dpi=200)
+    if show:
+        plt.show()
+    plt.close(fig)
+
+
 def plot_dispatch(
     dispatch: pd.DataFrame, scenario: str, output: Path, show: bool
 ) -> None:
     """Create stacked area plot showing how supply meets load."""
+    if show:
+        _ensure_interactive_backend()
     fig, ax = plt.subplots(figsize=(12, 6))
     ax.stackplot(
         dispatch["time"],
@@ -123,6 +172,17 @@ def main() -> None:
         help="Nom du fichier PNG de sortie.",
     )
     parser.add_argument(
+        "--plot-profile",
+        action="store_true",
+        help="Génère un plot des profils bruts (load, solaire dispo, vent dispo) avant le dispatch.",
+    )
+    parser.add_argument(
+        "--profile-output",
+        type=Path,
+        default=Path("profile.png"),
+        help="Nom du PNG pour le plot des profils bruts.",
+    )
+    parser.add_argument(
         "--show",
         action="store_true",
         help="Affiche la figure à l'écran en plus de sauvegarder le PNG.",
@@ -130,6 +190,11 @@ def main() -> None:
     args = parser.parse_args()
 
     data, params = read_inputs(args.excel, args.scenario)
+
+    if args.plot_profile:
+        plot_profile(data, params["capacities"], args.scenario, args.profile_output, args.show)
+        print(f"Profil brut sauvegardé dans {args.profile_output}")
+
     dispatch = dispatch_min_cost(data, params["capacities"], params["costs"])
 
     total_var_cost = dispatch["variable_cost"].sum()
