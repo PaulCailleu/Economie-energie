@@ -9,6 +9,7 @@ import altair as alt
 
 YEARS = 20
 DISCOUNT_RATE = 0.05
+EXISTING_DIESEL_CAP = 16.0  # MW déjà installés
 
 
 def annuity_factor(r=DISCOUNT_RATE, n=YEARS):
@@ -19,26 +20,32 @@ A = annuity_factor()
 
 # Paramètres techno-éco par défaut (à adapter si besoin)
 DEFAULT_PARAMS = {
-    "capex_solar": 600_000,      # €/MW
-    "capex_wind": 1_300_000,     # €/MW
-    "capex_diesel": 600_000,     # €/MW
-    "capex_bat_p": 150_000,      # €/MW
-    "capex_bat_e": 250_000,      # €/MWh
+    # CAPEX (investissements initiaux)
+    "capex_solar": 935_000,      # €/MW
+    "capex_wind": 1_850_000,     # €/MW
+    "capex_diesel": 800_000,     # €/MW
+    "capex_bat_p": 180_000,      # €/MW
+    "capex_bat_e": 400_000,      # €/MWh
 
-    "omfix_solar": 15_000,       # €/MW/an
-    "omfix_wind": 40_000,        # €/MW/an
-    "omfix_diesel": 20_000,      # €/MW/an
+    # O&M fixes annuels
+    "omfix_solar": 23_000,       # €/MW/an
+    "omfix_wind": 45_000,        # €/MW/an
+    "omfix_diesel": 50_000,      # €/MW/an
     "omfix_bat_p": 5_000,        # €/MW/an
     "omfix_bat_e": 5_000,        # €/MWh/an
 
-    "fuel_diesel": 350,          # €/MWh
-    "omvar_diesel": 5,           # €/MWh
+    # Coûts variables – dans l’Excel, on n’a que le fuel pour le diesel
+    "fuel_diesel": 47,           # €/MWh
+    "omvar_diesel": 0,           # €/MWh  # laissé paramétrable mais 0 par défaut pour coller à l’Excel
 
-    "co2_factor_diesel": 0.7,    # tCO2/MWh
-    "co2_price": 80,             # €/tCO2
+    # CO2 – utilisé seulement pour les indicateurs, PAS dans les coûts
+    "co2_factor_diesel": 0.24,   # tCO2/MWh (comme ton Excel)
+    "co2_price": 0,              # €/tCO₂  # non utilisé dans les coûts
 
+    # Coût de l'énergie non servie
     "cost_END": 10_000,          # €/MWh
 }
+
 
 PARAM_LABELS = {
     "capex_solar": "CAPEX solaire (€/MW installé)",
@@ -188,7 +195,8 @@ def simulate_rule_based(profiles, K_solar, K_wind, K_diesel, K_bat_p, K_bat_e):
 
 def compute_metrics(ts, caps, params):
     """
-    Calcule les coûts, CO2, END, heures d'indisponibilité, LCOE, etc.
+    Calcule les coûts, CO2, END, LCOE, etc.
+    Aligné sur la logique de l'Excel.
     """
     p = params
     K_solar = caps["solar"]
@@ -201,16 +209,20 @@ def compute_metrics(ts, caps, params):
     E_diesel = float(ts["P_diesel"].sum())   # MWh/an
     E_END = float(ts["END"].sum())           # MWh/an
 
-    # Investissements (payés année 0)
+    K_diesel_total = caps["diesel"]
+    K_diesel_new = max(0.0, K_diesel_total - EXISTING_DIESEL_CAP)
+
+
+    # 1) Investissements (année 0) = total C_I dans l'Excel
     C_inv = (
         p["capex_solar"] * K_solar
         + p["capex_wind"] * K_wind
-        + p["capex_diesel"] * K_diesel
+        + p["capex_diesel"] * K_diesel_new
         + p["capex_bat_p"] * K_bat_p
         + p["capex_bat_e"] * K_bat_e
     )
 
-    # O&M fixes annuels
+    # 2) O&M fixes annuels = total C_O&M (€/an)
     C_om_fix = (
         p["omfix_solar"] * K_solar
         + p["omfix_wind"] * K_wind
@@ -219,29 +231,35 @@ def compute_metrics(ts, caps, params):
         + p["omfix_bat_e"] * K_bat_e
     )
 
-    # Coûts variables diesel
+    # 3) Coûts variables diesel = Total C_Fuel (€/an) + O&M var si tu veux les garder
     C_fuel = E_diesel * p["fuel_diesel"]
-    C_om_var = E_diesel * p["omvar_diesel"]
+    C_om_var = E_diesel * p["omvar_diesel"]  # ici 0 si tu suis l'Excel
 
-    # Coût END
+    # 4) Coût END (LOLE) = Total C_LOLE (€/an)
     C_END = E_END * p["cost_END"]
 
-    # CO2
-    CO2 = E_diesel * p["co2_factor_diesel"]
+    # 5) CO2 – seulement pour les indicateurs (aucun coût dans C_annual)
+    CO2 = E_diesel * p["co2_factor_diesel"]  # tCO2/an
+    # Pas de coût CO2 dans le total : C_CO2 = 0 si co2_price=0
     C_CO2 = CO2 * p["co2_price"]
 
-    # Coût annuel total (sans actualisation)
-    C_annual = C_om_fix + C_fuel + C_om_var + C_END + C_CO2
+    # 6) Coût annuel total "Excel-like" (sans actualisation)
+    #    = C_O&M + C_Fuel + C_LOLE (+ éventuellement C_om_var)
+    C_annual = C_om_fix + C_fuel + C_om_var + C_END
 
-    # Facteur de PV des coûts annuels
-    PV_factor = (1 - (1 + DISCOUNT_RATE) ** -YEARS) / DISCOUNT_RATE
+    # 7) Facteur de valeur actuelle sur 20 ans à 5 % (NPV de 1 €/an)
+    PV_factor = (1 - (1 + DISCOUNT_RATE) ** -YEARS) / DISCOUNT_RATE  # ≈ 12.46
 
+    # 8) Coût total actualisé (ligne "total present costs" de l'Excel)
     C_total = C_inv + C_annual * PV_factor
 
-    # Heures d'indisponibilité (au moins un peu d'END)
+    # 9) CO2 actualisé (comme "CO2 emissions actualised en tCO2_2026")
+    PV_CO2 = CO2 * PV_factor
+
+    # 10) Heures d'indisponibilité
     unavailability_hours = int((ts["END"] > 0).sum())
 
-    # LCOE (€/MWh servi) : coût total / énergie servie actualisée
+    # 11) LCOE système (comme "System LCOE" dans ton tableau)
     energy_served_per_year = total_load - E_END
     if energy_served_per_year > 0:
         PV_energy_served = energy_served_per_year * PV_factor
@@ -249,26 +267,33 @@ def compute_metrics(ts, caps, params):
     else:
         LCOE = None
 
-    # OPEX annuel "technique" (sans END ni CO2)
+    # OPEX annuel "technique" (fuel + O&M, sans END ni CO2)
     OPEX_annual_technical = C_om_fix + C_fuel + C_om_var
 
     metrics = {
+        # CAPEX et OPEX
         "C_inv": C_inv,
         "C_om_fix": C_om_fix,
         "C_fuel": C_fuel,
         "C_om_var": C_om_var,
         "C_END": C_END,
-        "C_CO2": C_CO2,
+        "C_CO2": C_CO2,  # sera 0 si co2_price=0
         "C_annual": C_annual,
         "C_total": C_total,
-        "CO2": CO2,
+
+        # Énergie et CO2
+        "CO2": CO2,          # tCO2/an
+        "PV_CO2": PV_CO2,    # tCO2 actualisées sur 20 ans
         "E_diesel": E_diesel,
         "E_END": E_END,
         "END_ratio": E_END / total_load if total_load > 0 else 0.0,
         "total_load": total_load,
+
+        # Indicateurs système
         "unavailability_hours": unavailability_hours,
         "LCOE": LCOE,
         "OPEX_annual_technical": OPEX_annual_technical,
+        "PV_factor": PV_factor,
     }
     return metrics
 
@@ -332,6 +357,7 @@ def grid_search_optimal_mix(profiles, params, objective_mode, max_end_ratio,
                         if objective_mode == "cost":
                             value = metrics["C_total"]
                         else:  # "co2"
+                            # CO2 annuel (PV_CO2 serait équivalent à un facteur près)
                             value = metrics["CO2"]
 
                         if (best_value is None) or (value < best_value):
@@ -358,10 +384,13 @@ st.markdown(
     """
 Cette application permet de :
 
-1. **Analyser les coûts** d’un mix (CAPEX, OPEX, CO₂, LCOE, heures d'indisponibilité).  
+1. **Analyser les coûts** d’un mix (CAPEX, OPEX, NPV sur 20 ans, LCOE, fiabilité).  
 2. **Choisir un mix de capacités** (MW solaire, éolien, diesel, batterie) ou
    **chercher un mix quasi-optimal** sur une grille (coût ou émissions).  
 3. Visualiser un **compte rendu graphique** : charge, production empilée, énergie non servie et curtailment.
+
+📌 **Important** : le CO₂ est ici traité comme **indicateur** (tCO₂/an, tCO₂ actualisées),
+mais n’est **pas monétisé** dans les coûts, comme dans le fichier Excel de référence.
 """
 )
 
@@ -422,16 +451,19 @@ with col0b:
                 label = PARAM_LABELS[key]
                 params[key] = st.number_input(label, value=float(DEFAULT_PARAMS[key]), step=10.0)
 
-    with st.expander("Coûts variables, CO₂ et coût de l'énergie non servie", expanded=False):
+    with st.expander("Coûts variables, CO₂ (indicateur) et énergie non servie", expanded=False):
         col_var1, col_var2 = st.columns(2)
         with col_var1:
             for key in ["fuel_diesel", "omvar_diesel"]:
                 label = PARAM_LABELS[key]
                 params[key] = st.number_input(label, value=float(DEFAULT_PARAMS[key]), step=10.0)
         with col_var2:
-            for key in ["co2_factor_diesel", "co2_price", "cost_END"]:
+            # On ne propose pas d'éditer le prix du CO₂ pour rester cohérent avec l’Excel
+            for key in ["co2_factor_diesel", "cost_END"]:
                 label = PARAM_LABELS[key]
                 params[key] = st.number_input(label, value=float(DEFAULT_PARAMS[key]), step=10.0)
+            # on fixe en dur co2_price à 0 dans params (non éditable)
+            params["co2_price"] = DEFAULT_PARAMS["co2_price"]
 
 st.markdown("### Hypothèses de fiabilité et critère d'optimisation")
 
@@ -613,21 +645,53 @@ Plus les pas sont fins, plus c'est précis, mais plus c'est long.
 if current_metrics is not None and current_ts is not None and current_caps is not None:
     st.markdown("## 3️⃣ Synthèse économique et de fiabilité")
 
-    colc1, colc2, colc3, colc4 = st.columns(4)
+    st.subheader("Synthèse économique (alignée sur le tableau Excel)")
+
+    # Ligne 1 : total C_I, total C_O&M, Total C_Fuel
+    colc1, colc2, colc3 = st.columns(3)
     with colc1:
         st.metric(
-            "LCOE (coût moyen actualisé)",
-            f"{current_metrics['LCOE']:.1f} €/MWh" if current_metrics["LCOE"] is not None else "n/a",
+            "total C_I",
+            f"{current_metrics['C_inv']:.0f} €",
         )
     with colc2:
-        st.metric("CAPEX total (année 0)", f"{current_metrics['C_inv']:.0f} €")
+        st.metric(
+            "total C_O&M",
+            f"{current_metrics['C_om_fix']:.0f} €/an",
+        )
     with colc3:
         st.metric(
-            "OPEX annuel technique (sans END ni CO₂)",
-            f"{current_metrics['OPEX_annual_technical']:.0f} €/an",
+            "Total C_Fuel",
+            f"{current_metrics['C_fuel']:.0f} €/an",
         )
+
+    # Ligne 2 : Total C_LOLE, total present costs, System LCOE
+    colc4, colc5, colc6 = st.columns(3)
     with colc4:
-        st.metric("Émissions annuelles de CO₂", f"{current_metrics['CO2']:.0f} tCO₂/an")
+        st.metric(
+            "Total C_LOLE",
+            f"{current_metrics['C_END']:.0f} €/an",
+        )
+    with colc5:
+        st.metric(
+            "total present costs",
+            f"{current_metrics['C_total']:.0f} €_2026",
+        )
+    with colc6:
+        st.metric(
+            "System LCOE",
+            f"{current_metrics['LCOE']:.1f} €_2026/MWh"
+            if current_metrics["LCOE"] is not None
+            else "n/a",
+        )
+
+    # CO2_Emissions (annuel)
+    st.metric(
+        "CO2_Emissions",
+        f"{current_metrics['CO2']:.0f} tCO2/an",
+    )
+
+    st.markdown("### Indicateurs de fiabilité")
 
     colf1, colf2 = st.columns(2)
     with colf1:
@@ -643,6 +707,81 @@ if current_metrics is not None and current_ts is not None and current_caps is no
 
     st.markdown("### Capacités installées du scénario étudié")
     st.write(current_caps)
+
+    # ------------------------------- #
+    #   3️⃣bis BILAN ANNUEL ÉNERGIE    #
+    # ------------------------------- #
+
+    st.markdown("## 📊 Bilan annuel d'utilisation par filière (MWh/an)")
+
+    T = len(current_ts)  # nb d'heures simulées
+    annualization_factor = 8760 / T  # annualisation si la simulation < 1 an
+
+    if T != 8760:
+        st.info(
+            f"Le profil contient {T} heures (pas un an complet). "
+            f"Les énergies sont annualisées via un facteur {annualization_factor:.2f}."
+        )
+    else:
+        st.caption("Profil annuel complet (8760 h) : pas d'annualisation.")
+
+    # Énergie “produite” (MWh/an) — dt = 1h
+    # Note : P_dis est l'énergie délivrée par la batterie (pas une source primaire).
+    annual_energy = {
+        "Solaire": float(current_ts["P_solar"].sum() * annualization_factor),
+        "Éolien": float(current_ts["P_wind"].sum() * annualization_factor),
+        "Diesel": float(current_ts["P_diesel"].sum() * annualization_factor),
+        "Batterie (décharge)": float(current_ts["P_dis"].sum() * annualization_factor),
+        "Énergie non servie (END)": float(current_ts["END"].sum() * annualization_factor),
+        "Surplus EnR (curtailment)": float(current_ts["Spill"].sum() * annualization_factor),
+    }
+
+    df_energy = (
+        pd.DataFrame({"Filière": list(annual_energy.keys()), "Énergie (MWh/an)": list(annual_energy.values())})
+        .sort_values("Énergie (MWh/an)", ascending=False)
+    )
+
+
+    # 2) Bar chart annuel
+    energy_bar = (
+        alt.Chart(df_energy)
+        .mark_bar()
+        .encode(
+            x=alt.X("Filière:N", sort="-y", title="Filière"),
+            y=alt.Y("Énergie (MWh/an):Q", title="Énergie (MWh/an)"),
+            tooltip=["Filière", alt.Tooltip("Énergie (MWh/an):Q", format=",.0f")],
+        )
+    )
+    st.altair_chart(energy_bar, use_container_width=True)
+
+    # 3) Part du mix (uniquement énergie SERVIE par filière “physique”)
+    # On exclut END et curtailment, et on exclut la batterie (car c'est un transfert).
+    served_sources = pd.DataFrame(
+        {
+            "Filière": ["Solaire", "Éolien", "Diesel"],
+            "Énergie (MWh/an)": [
+                annual_energy["Solaire"],
+                annual_energy["Éolien"],
+                annual_energy["Diesel"],
+            ],
+        }
+    )
+    served_total = served_sources["Énergie (MWh/an)"].sum()
+    if served_total > 0:
+        served_sources["Part (%)"] = 100 * served_sources["Énergie (MWh/an)"] / served_total
+
+        mix_pie = (
+            alt.Chart(served_sources)
+            .mark_arc()
+            .encode(
+                theta=alt.Theta("Énergie (MWh/an):Q"),
+                color=alt.Color("Filière:N", title="Filière"),
+                tooltip=["Filière", alt.Tooltip("Énergie (MWh/an):Q", format=",.0f"), alt.Tooltip("Part (%):Q", format=".1f")],
+            )
+        )
+        st.markdown("### Répartition du mix servi (Solaire/Éolien/Diesel)")
+        st.altair_chart(mix_pie, use_container_width=True)
+
 
     # ------------------------------- #
     #   4️⃣ COMPTE RENDU VISUEL       #
@@ -692,6 +831,41 @@ if current_metrics is not None and current_ts is not None and current_caps is no
         columns={"END": "Énergie non servie", "Spill": "Surplus EnR (curtailment)"}
     )
     st.line_chart(df_end.set_index("hour_idx")[["Énergie non servie", "Surplus EnR (curtailment)"]])
+
+    # ------------------------------- #
+    #   🔋 Analyse du fonctionnement de la batterie
+    # ------------------------------- #
+
+    st.markdown("## 🔋 Analyse du fonctionnement de la batterie (5 jours)")
+
+    # On limite l'affichage aux 5 premiers jours
+    n_show_bat = min(5 * 24, len(current_ts))
+    bat_plot = current_ts.head(n_show_bat).copy()
+    bat_plot["hour_idx"] = np.arange(len(bat_plot))
+
+
+    # 1️⃣ Charge / décharge de la batterie
+    st.subheader("Puissance de charge / décharge de la batterie")
+
+    bat_power = bat_plot[["hour_idx", "P_ch", "P_dis"]].melt(
+        id_vars="hour_idx",
+        var_name="Mode",
+        value_name="Puissance (MW)"
+    )
+
+    bat_power_chart = (
+        alt.Chart(bat_power)
+        .mark_line()
+        .encode(
+            x="hour_idx",
+            y="Puissance (MW)",
+            color=alt.Color("Mode:N", title="Mode batterie"),
+            tooltip=["hour_idx", "Mode", "Puissance (MW)"]
+        )
+    )
+
+    st.altair_chart(bat_power_chart, use_container_width=True)
+
 
 else:
     st.info("➡️ Définis un scénario ou lance une optimisation pour afficher les indicateurs et les graphiques.")
