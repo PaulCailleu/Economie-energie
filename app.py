@@ -12,13 +12,6 @@ DISCOUNT_RATE = 0.05
 EXISTING_DIESEL_CAP = 16.0  # MW déjà installés
 
 
-def annuity_factor(r=DISCOUNT_RATE, n=YEARS):
-    return r / (1 - (1 + r) ** -n)
-
-
-A = annuity_factor()
-
-# Paramètres techno-éco par défaut (à adapter si besoin)
 DEFAULT_PARAMS = {
     # CAPEX (investissements initiaux)
     "capex_solar": 935_000,      # €/MW
@@ -34,18 +27,17 @@ DEFAULT_PARAMS = {
     "omfix_bat_p": 5_000,        # €/MW/an
     "omfix_bat_e": 5_000,        # €/MWh/an
 
-    # Coûts variables – dans l’Excel, on n’a que le fuel pour le diesel
+    # Coûts variables
     "fuel_diesel": 47,           # €/MWh
-    "omvar_diesel": 0,           # €/MWh  # laissé paramétrable mais 0 par défaut pour coller à l’Excel
+    "omvar_diesel": 0,           # €/MWh
 
-    # CO2 – utilisé seulement pour les indicateurs, PAS dans les coûts
-    "co2_factor_diesel": 0.24,   # tCO2/MWh (comme ton Excel)
-    "co2_price": 0,              # €/tCO₂  # non utilisé dans les coûts
+    # CO2 – indicateur
+    "co2_factor_diesel": 0.24,   # tCO2/MWh
+    "co2_price": 0,              # €/tCO₂ (non utilisé dans les coûts ici)
 
     # Coût de l'énergie non servie
     "cost_END": 10_000,          # €/MWh
 }
-
 
 PARAM_LABELS = {
     "capex_solar": "CAPEX solaire (€/MW installé)",
@@ -61,37 +53,30 @@ PARAM_LABELS = {
     "fuel_diesel": "Coût carburant diesel (€/MWh)",
     "omvar_diesel": "O&M variable diesel (€/MWh)",
     "co2_factor_diesel": "Facteur d'émission diesel (tCO₂/MWh élec)",
-    "co2_price": "Prix du CO₂ (€/tCO₂)",
     "cost_END": "Coût de l'énergie non servie (€/MWh)",
 }
+
 
 # ===================== #
 #   PROFIL DÉMO         #
 # ===================== #
 
 def generate_demo_profiles(n_days=7):
-    """Profil fictif si l'utilisateur n’upload pas de données."""
     hours = np.arange(n_days * 24)
-    # Demande base 12 MW + variation journalière
+
     load = 12 + 5 * np.sin(2 * np.pi * hours / 24 - np.pi / 2)
     load = np.clip(load, 7, 24)
 
-    # Solaire : seulement le jour
     cf_solar = np.maximum(0, np.sin(2 * np.pi * (hours % 24) / 24 - np.pi / 2))
     cf_solar = cf_solar * 0.9
 
-    # Éolien : bruit autour de 0.4
     rng = np.random.default_rng(42)
     cf_wind = 0.4 + 0.2 * rng.standard_normal(len(hours))
     cf_wind = np.clip(cf_wind, 0, 1)
 
-    df = pd.DataFrame({
-        "hour": hours,
-        "load": load,
-        "cf_solar": cf_solar,
-        "cf_wind": cf_wind,
-    })
-    return df
+    return pd.DataFrame(
+        {"hour": hours, "load": load, "cf_solar": cf_solar, "cf_wind": cf_wind}
+    )
 
 
 # ===================== #
@@ -99,12 +84,6 @@ def generate_demo_profiles(n_days=7):
 # ===================== #
 
 def simulate_rule_based(profiles, K_solar, K_wind, K_diesel, K_bat_p, K_bat_e):
-    """
-    Simulation horaire avec les règles type Excel :
-    - priorité aux EnR (solaire + éolien),
-    - si surplus : charge batterie puis curtailment,
-    - si déficit : décharge batterie, puis diesel, puis END.
-    """
     load = profiles["load"].values
     cf_solar = profiles["cf_solar"].values
     cf_wind = profiles["cf_wind"].values
@@ -119,74 +98,58 @@ def simulate_rule_based(profiles, K_solar, K_wind, K_diesel, K_bat_p, K_bat_e):
     END = np.zeros(T)
     Spill = np.zeros(T)
 
-    # Batterie démarre pleine (comme dans l'énoncé)
-    e = K_bat_e
+    e = K_bat_e  # batterie démarre pleine
 
     for t in range(T):
-        # Potentiel renouvelable
         P_solar_max = cf_solar[t] * K_solar
         P_wind_max = cf_wind[t] * K_wind
         ren_dispo = P_solar_max + P_wind_max
         d = load[t]
 
         if ren_dispo >= d:
-            # Toute la demande couverte par les EnR
             P_solar[t] = min(P_solar_max, d)
             reste = d - P_solar[t]
             P_wind[t] = min(P_wind_max, reste)
 
             surplus = ren_dispo - d
-
-            # Charge batterie avec le surplus
             charge_possible = min(surplus, K_bat_p, max(0.0, K_bat_e - e))
             P_ch[t] = charge_possible
             e += charge_possible
 
             Spill[t] = surplus - charge_possible
 
-            P_diesel[t] = 0.0
-            P_dis[t] = 0.0
-            END[t] = 0.0
-
         else:
-            # Renouvelables insuffisants : on utilise tout
             P_solar[t] = P_solar_max
             P_wind[t] = P_wind_max
             deficit = d - ren_dispo
 
-            # Décharge batterie
             dis_possible = min(deficit, K_bat_p, e)
             P_dis[t] = dis_possible
             e -= dis_possible
             deficit -= dis_possible
 
-            # Diesel
             diesel_possible = min(deficit, K_diesel)
             P_diesel[t] = diesel_possible
             deficit -= diesel_possible
 
-            # Ce qui reste, c'est de l'END
             END[t] = max(0.0, deficit)
 
-            P_ch[t] = 0.0
-            Spill[t] = 0.0
-
-        # On borne le niveau de batterie
         e = min(max(e, 0.0), K_bat_e)
         E_bat[t] = e
 
-    ts = pd.DataFrame({
-        "load": load,
-        "P_solar": P_solar,
-        "P_wind": P_wind,
-        "P_diesel": P_diesel,
-        "P_ch": P_ch,
-        "P_dis": P_dis,
-        "E_bat": E_bat,
-        "END": END,
-        "Spill": Spill,
-    })
-    return ts
+    return pd.DataFrame(
+        {
+            "load": load,
+            "P_solar": P_solar,
+            "P_wind": P_wind,
+            "P_diesel": P_diesel,
+            "P_ch": P_ch,
+            "P_dis": P_dis,
+            "E_bat": E_bat,
+            "END": END,
+            "Spill": Spill,
+        }
+    )
 
 
 # ===================== #
@@ -194,10 +157,6 @@ def simulate_rule_based(profiles, K_solar, K_wind, K_diesel, K_bat_p, K_bat_e):
 # ===================== #
 
 def compute_metrics(ts, caps, params):
-    """
-    Calcule les coûts, CO2, END, LCOE, etc.
-    Aligné sur la logique de l'Excel.
-    """
     p = params
     K_solar = caps["solar"]
     K_wind = caps["wind"]
@@ -206,14 +165,11 @@ def compute_metrics(ts, caps, params):
     K_bat_e = caps["bat_e"]
 
     total_load = float(ts["load"].sum())
-    E_diesel = float(ts["P_diesel"].sum())   # MWh/an
-    E_END = float(ts["END"].sum())           # MWh/an
+    E_diesel = float(ts["P_diesel"].sum())
+    E_END = float(ts["END"].sum())
 
-    K_diesel_total = caps["diesel"]
-    K_diesel_new = max(0.0, K_diesel_total - EXISTING_DIESEL_CAP)
+    K_diesel_new = max(0.0, K_diesel - EXISTING_DIESEL_CAP)
 
-
-    # 1) Investissements (année 0) = total C_I dans l'Excel
     C_inv = (
         p["capex_solar"] * K_solar
         + p["capex_wind"] * K_wind
@@ -222,7 +178,6 @@ def compute_metrics(ts, caps, params):
         + p["capex_bat_e"] * K_bat_e
     )
 
-    # 2) O&M fixes annuels = total C_O&M (€/an)
     C_om_fix = (
         p["omfix_solar"] * K_solar
         + p["omfix_wind"] * K_wind
@@ -231,99 +186,73 @@ def compute_metrics(ts, caps, params):
         + p["omfix_bat_e"] * K_bat_e
     )
 
-    # 3) Coûts variables diesel = Total C_Fuel (€/an) + O&M var si tu veux les garder
     C_fuel = E_diesel * p["fuel_diesel"]
-    C_om_var = E_diesel * p["omvar_diesel"]  # ici 0 si tu suis l'Excel
-
-    # 4) Coût END (LOLE) = Total C_LOLE (€/an)
+    C_om_var = E_diesel * p["omvar_diesel"]
     C_END = E_END * p["cost_END"]
 
-    # 5) CO2 – seulement pour les indicateurs (aucun coût dans C_annual)
-    CO2 = E_diesel * p["co2_factor_diesel"]  # tCO2/an
-    # Pas de coût CO2 dans le total : C_CO2 = 0 si co2_price=0
-    C_CO2 = CO2 * p["co2_price"]
+    CO2 = E_diesel * p["co2_factor_diesel"]
+    C_CO2 = CO2 * p["co2_price"]  # 0 par défaut
 
-    # 6) Coût annuel total "Excel-like" (sans actualisation)
-    #    = C_O&M + C_Fuel + C_LOLE (+ éventuellement C_om_var)
     C_annual = C_om_fix + C_fuel + C_om_var + C_END
 
-    # 7) Facteur de valeur actuelle sur 20 ans à 5 % (NPV de 1 €/an)
-    PV_factor = (1 - (1 + DISCOUNT_RATE) ** -YEARS) / DISCOUNT_RATE  # ≈ 12.46
-
-    # 8) Coût total actualisé (ligne "total present costs" de l'Excel)
+    PV_factor = (1 - (1 + DISCOUNT_RATE) ** -YEARS) / DISCOUNT_RATE
     C_total = C_inv + C_annual * PV_factor
-
-    # 9) CO2 actualisé (comme "CO2 emissions actualised en tCO2_2026")
     PV_CO2 = CO2 * PV_factor
 
-    # 10) Heures d'indisponibilité
     unavailability_hours = int((ts["END"] > 0).sum())
 
-    # 11) LCOE système (comme "System LCOE" dans ton tableau)
-    energy_served_per_year = total_load - E_END
-    if energy_served_per_year > 0:
-        PV_energy_served = energy_served_per_year * PV_factor
-        LCOE = C_total / PV_energy_served
-    else:
-        LCOE = None
+    energy_served = total_load - E_END
+    LCOE = (C_total / (energy_served * PV_factor)) if energy_served > 0 else None
 
-    # OPEX annuel "technique" (fuel + O&M, sans END ni CO2)
-    OPEX_annual_technical = C_om_fix + C_fuel + C_om_var
-
-    metrics = {
-        # CAPEX et OPEX
+    return {
         "C_inv": C_inv,
         "C_om_fix": C_om_fix,
         "C_fuel": C_fuel,
         "C_om_var": C_om_var,
         "C_END": C_END,
-        "C_CO2": C_CO2,  # sera 0 si co2_price=0
+        "C_CO2": C_CO2,
         "C_annual": C_annual,
         "C_total": C_total,
-
-        # Énergie et CO2
-        "CO2": CO2,          # tCO2/an
-        "PV_CO2": PV_CO2,    # tCO2 actualisées sur 20 ans
+        "CO2": CO2,
+        "PV_CO2": PV_CO2,
         "E_diesel": E_diesel,
         "E_END": E_END,
         "END_ratio": E_END / total_load if total_load > 0 else 0.0,
         "total_load": total_load,
-
-        # Indicateurs système
         "unavailability_hours": unavailability_hours,
         "LCOE": LCOE,
-        "OPEX_annual_technical": OPEX_annual_technical,
         "PV_factor": PV_factor,
     }
-    return metrics
 
 
 # ===================== #
-#   GRID SEARCH OPTI    #
+#   GRID SEARCH COMPLET #
 # ===================== #
 
-def grid_search_optimal_mix(profiles, params, objective_mode, max_end_ratio,
-                            solar_range, wind_range, diesel_range,
-                            bat_p_range, bat_e_range):
-    """
-    Recherche du mix optimal sur une grille de capacités, en utilisant
-    la simulation rule-based. ATTENTION : le nombre de combinaisons
-    peut vite exploser si les pas sont trop fins.
-    """
+def grid_search_optimal_mix(
+    profiles,
+    params,
+    objective_mode,
+    max_end_ratio,
+    solar_range,
+    wind_range,
+    diesel_range,
+    bat_p_range,
+    bat_e_range,
+):
     best_caps = None
     best_metrics = None
     best_ts = None
     best_value = None
 
+    rows = []
+
     total_combos = (
-        len(solar_range)
-        * len(wind_range)
-        * len(diesel_range)
-        * len(bat_p_range)
-        * len(bat_e_range)
+        len(solar_range) * len(wind_range) * len(diesel_range) * len(bat_p_range) * len(bat_e_range)
     )
     progress = st.progress(0)
     done = 0
+    denom = max(1, total_combos)
 
     for Ks in solar_range:
         for Kw in wind_range:
@@ -339,37 +268,225 @@ def grid_search_optimal_mix(profiles, params, objective_mode, max_end_ratio,
                         }
 
                         ts = simulate_rule_based(
-                            profiles,
-                            caps["solar"],
-                            caps["wind"],
-                            caps["diesel"],
-                            caps["bat_p"],
-                            caps["bat_e"],
+                            profiles, caps["solar"], caps["wind"], caps["diesel"], caps["bat_p"], caps["bat_e"]
                         )
                         metrics = compute_metrics(ts, caps, params)
+                        feasible = metrics["END_ratio"] <= max_end_ratio
 
-                        # Contrôle de l'indisponibilité
-                        if metrics["END_ratio"] > max_end_ratio:
-                            done += 1
-                            progress.progress(done / total_combos)
-                            continue
+                        rows.append(
+                            {
+                                "solar": caps["solar"],
+                                "wind": caps["wind"],
+                                "diesel": caps["diesel"],
+                                "bat_p": caps["bat_p"],
+                                "bat_e": caps["bat_e"],
+                                "C_total": metrics["C_total"],
+                                "LCOE": metrics["LCOE"] if metrics["LCOE"] is not None else np.nan,
+                                "CO2": metrics["CO2"],
+                                "END_ratio": metrics["END_ratio"],
+                                "feasible": feasible,
+                                "phase": "full",
+                            }
+                        )
 
-                        if objective_mode == "cost":
-                            value = metrics["C_total"]
-                        else:  # "co2"
-                            # CO2 annuel (PV_CO2 serait équivalent à un facteur près)
-                            value = metrics["CO2"]
-
-                        if (best_value is None) or (value < best_value):
-                            best_value = value
-                            best_caps = caps
-                            best_metrics = metrics
-                            best_ts = ts
+                        if feasible:
+                            value = metrics["C_total"] if objective_mode == "cost" else metrics["CO2"]
+                            if (best_value is None) or (value < best_value):
+                                best_value = value
+                                best_caps = caps
+                                best_metrics = metrics
+                                best_ts = ts
 
                         done += 1
-                        progress.progress(done / total_combos)
+                        progress.progress(done / denom)
 
-    return best_caps, best_metrics, best_ts
+    df_scenarios = pd.DataFrame(rows)
+    return best_caps, best_metrics, best_ts, df_scenarios
+
+
+# ===================== #
+#   OPTI RAPIDE (COARSE→FINE)
+# ===================== #
+
+def grid_search_optimal_mix_fast(
+    profiles,
+    params,
+    objective_mode,
+    max_end_ratio,
+    solar_range,
+    wind_range,
+    diesel_range,
+    bat_p_range,
+    bat_e_range,
+    coarse_stride=2,
+    refine_radius_steps=1,
+    keep_rows=True,
+):
+    def eval_caps(caps):
+        ts = simulate_rule_based(
+            profiles, caps["solar"], caps["wind"], caps["diesel"], caps["bat_p"], caps["bat_e"]
+        )
+        metrics = compute_metrics(ts, caps, params)
+        feasible = metrics["END_ratio"] <= max_end_ratio
+        value = metrics["C_total"] if objective_mode == "cost" else metrics["CO2"]
+        return ts, metrics, feasible, value
+
+    def as_float_array(arr):
+        return np.array(list(arr), dtype=float)
+
+    Ks = as_float_array(solar_range)
+    Kw = as_float_array(wind_range)
+    Kd = as_float_array(diesel_range)
+    Kbp = as_float_array(bat_p_range)
+    Kbe = as_float_array(bat_e_range)
+
+    Ks_c = Ks[::coarse_stride] if len(Ks) else Ks
+    Kw_c = Kw[::coarse_stride] if len(Kw) else Kw
+    Kd_c = Kd[::coarse_stride] if len(Kd) else Kd
+    Kbp_c = Kbp[::coarse_stride] if len(Kbp) else Kbp
+    Kbe_c = Kbe[::coarse_stride] if len(Kbe) else Kbe
+
+    best_caps = None
+    best_metrics = None
+    best_ts = None
+    best_value = None
+    rows = []
+
+    total_coarse = len(Ks_c) * len(Kw_c) * len(Kd_c) * len(Kbp_c) * len(Kbe_c)
+    progress = st.progress(0)
+    done = 0
+    denom = max(1, total_coarse)
+
+    for s in Ks_c:
+        for w in Kw_c:
+            for d in Kd_c:
+                for bp in Kbp_c:
+                    for be in Kbe_c:
+                        caps = {"solar": float(s), "wind": float(w), "diesel": float(d),
+                                "bat_p": float(bp), "bat_e": float(be)}
+                        ts, metrics, feasible, value = eval_caps(caps)
+
+                        if keep_rows:
+                            rows.append({
+                                "solar": caps["solar"], "wind": caps["wind"], "diesel": caps["diesel"],
+                                "bat_p": caps["bat_p"], "bat_e": caps["bat_e"],
+                                "C_total": metrics["C_total"],
+                                "LCOE": metrics["LCOE"] if metrics["LCOE"] is not None else np.nan,
+                                "CO2": metrics["CO2"],
+                                "END_ratio": metrics["END_ratio"],
+                                "feasible": feasible,
+                                "phase": "coarse",
+                            })
+
+                        if feasible and ((best_value is None) or (value < best_value)):
+                            best_value = value
+                            best_caps, best_metrics, best_ts = caps, metrics, ts
+
+                        done += 1
+                        progress.progress(done / denom)
+
+    if best_caps is None:
+        st.warning("Aucun scénario faisable trouvé en phase coarse → fallback grid-search complet.")
+        return grid_search_optimal_mix(
+            profiles, params, objective_mode, max_end_ratio,
+            solar_range, wind_range, diesel_range, bat_p_range, bat_e_range
+        )
+
+    def idx_nearest(arr, v):
+        return int(np.argmin(np.abs(arr - v)))
+
+    i_s = idx_nearest(Ks, best_caps["solar"])
+    i_w = idx_nearest(Kw, best_caps["wind"])
+    i_d = idx_nearest(Kd, best_caps["diesel"])
+    i_bp = idx_nearest(Kbp, best_caps["bat_p"])
+    i_be = idx_nearest(Kbe, best_caps["bat_e"])
+
+    def neighborhood(arr, i0):
+        lo = max(0, i0 - refine_radius_steps)
+        hi = min(len(arr) - 1, i0 + refine_radius_steps)
+        return arr[lo:hi + 1]
+
+    Ks_f = neighborhood(Ks, i_s)
+    Kw_f = neighborhood(Kw, i_w)
+    Kd_f = neighborhood(Kd, i_d)
+    Kbp_f = neighborhood(Kbp, i_bp)
+    Kbe_f = neighborhood(Kbe, i_be)
+
+    total_fine = len(Ks_f) * len(Kw_f) * len(Kd_f) * len(Kbp_f) * len(Kbe_f)
+    done = 0
+    denom = max(1, total_fine)
+    st.caption(f"Raffinement local : {total_fine} combinaisons")
+
+    for s in Ks_f:
+        for w in Kw_f:
+            for d in Kd_f:
+                for bp in Kbp_f:
+                    for be in Kbe_f:
+                        caps = {"solar": float(s), "wind": float(w), "diesel": float(d),
+                                "bat_p": float(bp), "bat_e": float(be)}
+                        ts, metrics, feasible, value = eval_caps(caps)
+
+                        if keep_rows:
+                            rows.append({
+                                "solar": caps["solar"], "wind": caps["wind"], "diesel": caps["diesel"],
+                                "bat_p": caps["bat_p"], "bat_e": caps["bat_e"],
+                                "C_total": metrics["C_total"],
+                                "LCOE": metrics["LCOE"] if metrics["LCOE"] is not None else np.nan,
+                                "CO2": metrics["CO2"],
+                                "END_ratio": metrics["END_ratio"],
+                                "feasible": feasible,
+                                "phase": "refine",
+                            })
+
+                        if feasible and (value < best_value):
+                            best_value = value
+                            best_caps, best_metrics, best_ts = caps, metrics, ts
+
+                        done += 1
+                        progress.progress(done / denom)
+
+    df_scenarios = pd.DataFrame(rows) if keep_rows else pd.DataFrame()
+    return best_caps, best_metrics, best_ts, df_scenarios
+
+
+# ===================== #
+#   HEATMAPS (GALERIE)  #
+# ===================== #
+
+def best_per_cell(df, x, y, metric="C_total"):
+    d = df.copy()
+    d = d.sort_values(metric, ascending=True)
+    d = d.drop_duplicates(subset=[x, y], keep="first")
+    return d
+
+
+def heatmap_rect(df, x, y, z="C_total", title=None):
+    return (
+        alt.Chart(df)
+        .mark_rect()
+        .encode(
+            x=alt.X(f"{x}:Q", title=x),
+            y=alt.Y(f"{y}:Q", title=y),
+            color=alt.Color(f"{z}:Q", title=z),
+            tooltip=[
+                alt.Tooltip(f"{x}:Q", title=x),
+                alt.Tooltip(f"{y}:Q", title=y),
+                alt.Tooltip("solar:Q", title="solar (MW)"),
+                alt.Tooltip("wind:Q", title="wind (MW)"),
+                alt.Tooltip("diesel:Q", title="diesel (MW)"),
+                alt.Tooltip("bat_p:Q", title="bat_p (MW)"),
+                alt.Tooltip("bat_e:Q", title="bat_e (MWh)"),
+                alt.Tooltip("C_total:Q", format=",.0f"),
+                alt.Tooltip("LCOE:Q", format=",.2f"),
+                alt.Tooltip("CO2:Q", format=",.0f"),
+                alt.Tooltip("END_ratio:Q", format=".4%"),
+                alt.Tooltip("feasible:N", title="feasible"),
+                alt.Tooltip("phase:N", title="phase"),
+            ],
+        )
+        .properties(height=260, title=title)
+        .interactive()
+    )
 
 
 # ===================== #
@@ -382,15 +499,7 @@ st.title("⚡ Système électrique isolé de l'île – simulation type Excel & 
 
 st.markdown(
     """
-Cette application permet de :
-
-1. **Analyser les coûts** d’un mix (CAPEX, OPEX, NPV sur 20 ans, LCOE, fiabilité).  
-2. **Choisir un mix de capacités** (MW solaire, éolien, diesel, batterie) ou
-   **chercher un mix quasi-optimal** sur une grille (coût ou émissions).  
-3. Visualiser un **compte rendu graphique** : charge, production empilée, énergie non servie et curtailment.
-
-📌 **Important** : le CO₂ est ici traité comme **indicateur** (tCO₂/an, tCO₂ actualisées),
-mais n’est **pas monétisé** dans les coûts, comme dans le fichier Excel de référence.
+Cet outils, permet de simuler les perfomances d'un mix énergétique à partir d'un fichier de données météo et de consommation.
 """
 )
 
@@ -398,151 +507,121 @@ mais n’est **pas monétisé** dans les coûts, comme dans le fichier Excel de 
 #  0️⃣ DONNÉES & HYPOTHÈSES  #
 # -------------------------- #
 
-st.markdown("## 0️⃣ Données d'entrée & hypothèses de coût")
+st.markdown("## Hypothèses de coût et données météo et consommation")
 
-col0a, col0b = st.columns([2, 3])
+col0a, col0b = st.columns([3, 3])
 
 with col0a:
     st.markdown("### Profil de charge et de production")
     uploaded = st.file_uploader(
-        "📁 Charger un fichier CSV (colonnes : hour, load, cf_wind, cf_solar)",
+        "Charger un CSV (colonnes : hour, load, cf_wind, cf_solar)",
         type=["csv"],
     )
 
     if uploaded is not None:
-        # 1) lecture en tenant compte de la virgule comme séparateur décimal
-        profiles = pd.read_csv(uploaded, decimal=',')
-
-        # 2) s'assurer que les colonnes numériques sont bien en float
+        profiles = pd.read_csv(uploaded, decimal=",")
         for col in ["load", "cf_wind", "cf_solar"]:
             profiles[col] = pd.to_numeric(profiles[col], errors="coerce")
-
-        st.success("Profil de charge/production chargé ✅")
+        st.success("Profil chargé ✅")
     else:
-        st.info("Aucun fichier fourni : utilisation d'un profil **démonstration** (7 jours).")
+        st.info("Aucun fichier : profil **démo** (7 jours).")
         profiles = generate_demo_profiles(n_days=7)
 
-    st.caption("Aperçu des données horaire (quelques premières lignes)")
+    st.caption("Aperçu des données")
     st.dataframe(profiles.head())
 
 with col0b:
     st.markdown("### Hypothèses techno-économiques")
 
     params = {}
-    with st.expander("CAPEX (investissement) – en €/MW ou €/MWh", expanded=False):
-        col_capex1, col_capex2 = st.columns(2)
-        with col_capex1:
+
+    with st.expander("CAPEX (€/MW ou €/MWh)", expanded=False):
+        c1, c2 = st.columns(2)
+        with c1:
             for key in ["capex_solar", "capex_wind", "capex_diesel"]:
-                label = PARAM_LABELS[key]
-                params[key] = st.number_input(label, value=float(DEFAULT_PARAMS[key]), step=10.0)
-        with col_capex2:
+                params[key] = st.number_input(PARAM_LABELS[key], value=float(DEFAULT_PARAMS[key]), step=10.0)
+        with c2:
             for key in ["capex_bat_p", "capex_bat_e"]:
-                label = PARAM_LABELS[key]
-                params[key] = st.number_input(label, value=float(DEFAULT_PARAMS[key]), step=10.0)
+                params[key] = st.number_input(PARAM_LABELS[key], value=float(DEFAULT_PARAMS[key]), step=10.0)
 
-    with st.expander("O&M fixes annuels – en €/MW/an ou €/MWh/an", expanded=False):
-        col_om1, col_om2 = st.columns(2)
-        with col_om1:
+    with st.expander("O&M fixes (€/MW/an ou €/MWh/an)", expanded=False):
+        c1, c2 = st.columns(2)
+        with c1:
             for key in ["omfix_solar", "omfix_wind", "omfix_diesel"]:
-                label = PARAM_LABELS[key]
-                params[key] = st.number_input(label, value=float(DEFAULT_PARAMS[key]), step=10.0)
-        with col_om2:
+                params[key] = st.number_input(PARAM_LABELS[key], value=float(DEFAULT_PARAMS[key]), step=10.0)
+        with c2:
             for key in ["omfix_bat_p", "omfix_bat_e"]:
-                label = PARAM_LABELS[key]
-                params[key] = st.number_input(label, value=float(DEFAULT_PARAMS[key]), step=10.0)
+                params[key] = st.number_input(PARAM_LABELS[key], value=float(DEFAULT_PARAMS[key]), step=10.0)
 
-    with st.expander("Coûts variables, CO₂ (indicateur) et énergie non servie", expanded=False):
-        col_var1, col_var2 = st.columns(2)
-        with col_var1:
+    with st.expander("Variables, CO₂ (indicateur), END", expanded=False):
+        c1, c2 = st.columns(2)
+        with c1:
             for key in ["fuel_diesel", "omvar_diesel"]:
-                label = PARAM_LABELS[key]
-                params[key] = st.number_input(label, value=float(DEFAULT_PARAMS[key]), step=10.0)
-        with col_var2:
-            # On ne propose pas d'éditer le prix du CO₂ pour rester cohérent avec l’Excel
+                params[key] = st.number_input(PARAM_LABELS[key], value=float(DEFAULT_PARAMS[key]), step=1.0)
+        with c2:
             for key in ["co2_factor_diesel", "cost_END"]:
-                label = PARAM_LABELS[key]
-                params[key] = st.number_input(label, value=float(DEFAULT_PARAMS[key]), step=10.0)
-            # on fixe en dur co2_price à 0 dans params (non éditable)
-            params["co2_price"] = DEFAULT_PARAMS["co2_price"]
+                params[key] = st.number_input(PARAM_LABELS[key], value=float(DEFAULT_PARAMS[key]), step=1.0)
 
-st.markdown("### Hypothèses de fiabilité et critère d'optimisation")
+        params["co2_price"] = 0.0  # fixé à 0 pour coller à ton cadre
 
-col_hyp1, col_hyp2 = st.columns(2)
-with col_hyp1:
+st.markdown("### Objectif du mode optimisation")
+
+c1, c2 = st.columns(2)
+with c1:
     max_end_ratio = st.slider(
-        "Indisponibilité maximale autorisée (END / demande annuelle)",
-        min_value=0.0,
-        max_value=0.05,
-        value=0.001,
-        step=0.001,
+        "Indisponibilité max (END / demande annuelle)",
+        0.0, 1.0, 0.0, 0.1
     )
-with col_hyp2:
+with c2:
     objective_mode_label = st.radio(
-        "Critère utilisé en mode 'mix quasi-optimal'",
-        options=[
-            "Minimiser le coût actualisé (donc le LCOE)",
-            "Minimiser les émissions de CO₂",
-        ],
+        "Objectif optimisation",
+        ["Minimiser le coût (C_total)", "Minimiser les émissions (CO2)"],
     )
     objective_mode = "cost" if objective_mode_label.startswith("Minimiser le coût") else "co2"
 
-st.markdown("---")
 
 # ------------------------------- #
-#  1️⃣ CHOIX DU TYPE D'ÉTUDE      #
+#  1️⃣ MODE D'ÉTUDE               #
 # ------------------------------- #
 
-st.markdown("## 1️⃣ Choix du type d'étude")
+st.markdown("## Choix du type d'étude")
 
 mode = st.radio(
-    "Comment souhaitez-vous explorer le mix de production ?",
-    [
-        "🧪 Tester un scénario avec des capacités installées choisies",
-        "🔍 Chercher un mix quasi-optimal (grid search)",
-    ],
+    "Mode",
+    [" Tester un scénario ", " Optimiser pour la méteo et la"],
 )
 
 current_caps = None
 current_metrics = None
 current_ts = None
+df_scenarios = None
 
 # ===================== #
 #     MODE SCÉNARIO     #
 # ===================== #
 
 if mode.startswith("🧪"):
-    st.markdown("## 2️⃣ Définir un scénario de capacités installées")
+    st.markdown("## 2️⃣ Scénario – capacités installées")
 
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        solar_cap = st.number_input(
-            "Capacité solaire installée (MW)", min_value=0.0, value=10.0, step=1.0
-        )
-        wind_cap = st.number_input(
-            "Capacité éolienne installée (MW)", min_value=0.0, value=10.0, step=1.0
-        )
-    with col2:
-        diesel_cap = st.number_input(
-            "Capacité installée de groupes diesel (MW)", min_value=0.0, value=24.0, step=1.0
-        )
-    with col3:
-        bat_p_cap = st.number_input(
-            "Puissance batterie installée (MW)", min_value=0.0, value=2.0, step=0.5
-        )
-        bat_e_cap = st.number_input(
-            "Capacité énergétique batterie (MWh)", min_value=0.0, value=4.0, step=1.0
-        )
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        solar_cap = st.slider("Solaire (MW)", 0.0, 150.0, 10.0, 1.0)
+        wind_cap = st.slider("Éolien (MW)", 0.0, 150.0, 10.0, 1.0)
+    with c2:
+        diesel_cap = st.slider("Diesel (MW)", 0.0, 150.0, 24.0, 1.0)
+    with c3:
+        bat_p_cap = st.slider("Batterie puissance (MW)", 0.0, 50.0, 2.0, 0.5)
+        bat_e_cap = st.slider("Batterie énergie (MWh)", 0.0, 200.0, 4.0, 1.0)
 
-    if st.button("▶️ Lancer la simulation du scénario"):
+    if st.button("▶️ Lancer la simulation"):
         current_caps = {
-            "solar": solar_cap,
-            "wind": wind_cap,
-            "diesel": diesel_cap,
-            "bat_p": bat_p_cap,
-            "bat_e": bat_e_cap,
+            "solar": float(solar_cap),
+            "wind": float(wind_cap),
+            "diesel": float(diesel_cap),
+            "bat_p": float(bat_p_cap),
+            "bat_e": float(bat_e_cap),
         }
-
-        with st.spinner("Simulation horaire (règles Excel-like)…"):
+        with st.spinner("Simulation horaire…"):
             current_ts = simulate_rule_based(
                 profiles,
                 current_caps["solar"],
@@ -552,7 +631,6 @@ if mode.startswith("🧪"):
                 current_caps["bat_e"],
             )
             current_metrics = compute_metrics(current_ts, current_caps, params)
-
         st.success("Simulation terminée ✅")
 
 # ===================== #
@@ -560,61 +638,58 @@ if mode.startswith("🧪"):
 # ===================== #
 
 else:
-    st.markdown("## 2️⃣ Chercher un mix de production quasi-optimal (grid search)")
+    st.markdown("## 2️⃣ Optimisation – définition de la grille + accélération")
 
-    st.markdown(
-        """
-La recherche se fait sur une **grille de capacités**.
-Plus les pas sont fins, plus c'est précis, mais plus c'est long.
-"""
-    )
+    st.info("Tu définis des plages via sliders + un pas. Ensuite optimisation rapide (coarse → refine).")
 
-    colr1, colr2 = st.columns(2)
-    with colr1:
-        solar_min = st.number_input("Solaire min (MW)", 0.0, 100.0, 0.0, 1.0)
-        solar_max = st.number_input("Solaire max (MW)", 0.0, 100.0, 20.0, 1.0)
-        solar_step = st.number_input("Pas solaire (MW)", 0.1, 50.0, 5.0, 0.1)
+    c1, c2 = st.columns(2)
+    with c1:
+        solar_rng = st.slider("Solaire (MW) – plage", 0.0, 250.0, (0.0, 20.0), 1.0)
+        solar_step = st.slider("Solaire – pas (MW)", 1.0, 50.0, 5.0, 1.0)
 
-        wind_min = st.number_input("Éolien min (MW)", 0.0, 100.0, 0.0, 1.0)
-        wind_max = st.number_input("Éolien max (MW)", 0.0, 100.0, 30.0, 1.0)
-        wind_step = st.number_input("Pas éolien (MW)", 0.1, 50.0, 5.0, 0.1)
+        wind_rng = st.slider("Éolien (MW) – plage", 0.0, 200.0, (0.0, 30.0), 1.0)
+        wind_step = st.slider("Éolien – pas (MW)", 1.0, 50.0, 5.0, 1.0)
 
-    with colr2:
-        diesel_min = st.number_input("Diesel min (MW)", 0.0, 100.0, 8.0, 1.0)
-        diesel_max = st.number_input("Diesel max (MW)", 0.0, 100.0, 24.0, 1.0)
-        diesel_step = st.number_input("Pas diesel (MW)", 0.1, 50.0, 4.0, 0.1)
+        diesel_rng = st.slider("Diesel (MW) – plage", 0.0, 200.0, (8.0, 24.0), 1.0)
+        diesel_step = st.slider("Diesel – pas (MW)", 1.0, 50.0, 4.0, 1.0)
 
-        bat_p_min = st.number_input("Puissance batterie min (MW)", 0.0, 100.0, 0.0, 0.5)
-        bat_p_max = st.number_input("Puissance batterie max (MW)", 0.0, 100.0, 4.0, 0.5)
-        bat_p_step = st.number_input("Pas puissance batterie (MW)", 0.1, 50.0, 2.0, 0.1)
+    with c2:
+        bat_p_rng = st.slider("Batterie P (MW) – plage", 0.0, 80.0, (0.0, 4.0), 0.5)
+        bat_p_step = st.slider("Batterie P – pas (MW)", 0.5, 20.0, 2.0, 0.5)
 
-        bat_e_min = st.number_input("Énergie batterie min (MWh)", 0.0, 200.0, 0.0, 1.0)
-        bat_e_max = st.number_input("Énergie batterie max (MWh)", 0.0, 200.0, 8.0, 1.0)
-        bat_e_step = st.number_input("Pas énergie batterie (MWh)", 0.1, 200.0, 4.0, 0.1)
+        bat_e_rng = st.slider("Batterie E (MWh) – plage", 0.0, 300.0, (0.0, 8.0), 1.0)
+        bat_e_step = st.slider("Batterie E – pas (MWh)", 1.0, 80.0, 4.0, 1.0)
 
-    if st.button("🔍 Lancer la recherche du mix quasi-optimal"):
-        solar_range = np.arange(solar_min, solar_max + 1e-9, solar_step)
-        wind_range = np.arange(wind_min, wind_max + 1e-9, wind_step)
-        diesel_range = np.arange(diesel_min, diesel_max + 1e-9, diesel_step)
-        bat_p_range = np.arange(bat_p_min, bat_p_max + 1e-9, bat_p_step)
-        bat_e_range = np.arange(bat_e_min, bat_e_max + 1e-9, bat_e_step)
-
-        total_combos = (
-            len(solar_range)
-            * len(wind_range)
-            * len(diesel_range)
-            * len(bat_p_range)
-            * len(bat_e_range)
+    st.markdown("### Accélération coarse → refine")
+    c3, c4 = st.columns(2)
+    with c3:
+        coarse_stride = st.slider(
+            "Coarse stride (1 = complet, 2 = 1 point sur 2, 3 = 1 sur 3)",
+            1, 5, 2, 1
+        )
+    with c4:
+        refine_radius_steps = st.slider(
+            "Refine radius (en nb de pas autour du meilleur coarse)",
+            0, 4, 1, 1
         )
 
-        if total_combos > 2000:
-            st.warning(
-                f"Attention : {total_combos} combinaisons à tester, "
-                "cela peut être long. Réduis les plages ou augmente les pas si besoin."
-            )
+    def make_range(vmin, vmax, step):
+        if vmax < vmin:
+            vmin, vmax = vmax, vmin
+        return np.arange(vmin, vmax + 1e-9, step)
 
-        with st.spinner("Recherche du mix quasi-optimal (grid search, règles Excel-like)…"):
-            best_caps, best_metrics, best_ts = grid_search_optimal_mix(
+    solar_range = make_range(*solar_rng, solar_step)
+    wind_range = make_range(*wind_rng, wind_step)
+    diesel_range = make_range(*diesel_rng, diesel_step)
+    bat_p_range = make_range(*bat_p_rng, bat_p_step)
+    bat_e_range = make_range(*bat_e_rng, bat_e_step)
+
+    total_full = len(solar_range) * len(wind_range) * len(diesel_range) * len(bat_p_range) * len(bat_e_range)
+    st.caption(f"Grille complète : **{total_full}** combinaisons (si coarse_stride=1).")
+
+    if st.button("🔍 Lancer l'optimisation rapide"):
+        with st.spinner("Optimisation coarse → refine…"):
+            best_caps, best_metrics, best_ts, df_scenarios = grid_search_optimal_mix_fast(
                 profiles,
                 params,
                 objective_mode,
@@ -624,180 +699,142 @@ Plus les pas sont fins, plus c'est précis, mais plus c'est long.
                 diesel_range,
                 bat_p_range,
                 bat_e_range,
+                coarse_stride=coarse_stride,
+                refine_radius_steps=refine_radius_steps,
+                keep_rows=True,
             )
 
         if best_caps is None:
-            st.error(
-                "Aucun mix ne respecte la contrainte d'indisponibilité avec la grille choisie. "
-                "Essaie d'élargir les plages (surtout diesel / batterie) "
-                "ou d'autoriser une indisponibilité un peu plus élevée."
-            )
+            st.error("Aucun scénario faisable trouvé (même après fallback).")
         else:
             current_caps = best_caps
             current_metrics = best_metrics
             current_ts = best_ts
-            st.success("Recherche terminée ✅")
+            st.success("Optimisation terminée ✅")
 
 # ------------------------------- #
-#   3️⃣ SYNTHÈSE COÛTS & FIABILITÉ #
+#   3️⃣ SYNTHÈSE + GALERIE         #
 # ------------------------------- #
 
 if current_metrics is not None and current_ts is not None and current_caps is not None:
-    st.markdown("## 3️⃣ Synthèse économique et de fiabilité")
+    st.markdown("## 3️⃣ Synthèse économique & fiabilité")
 
-    st.subheader("Synthèse économique (alignée sur le tableau Excel)")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.metric("total C_I", f"{current_metrics['C_inv']:.0f} €")
+    with c2:
+        st.metric("total C_O&M", f"{current_metrics['C_om_fix']:.0f} €/an")
+    with c3:
+        st.metric("Total C_Fuel", f"{current_metrics['C_fuel']:.0f} €/an")
 
-    # Ligne 1 : total C_I, total C_O&M, Total C_Fuel
-    colc1, colc2, colc3 = st.columns(3)
-    with colc1:
-        st.metric(
-            "total C_I",
-            f"{current_metrics['C_inv']:.0f} €",
-        )
-    with colc2:
-        st.metric(
-            "total C_O&M",
-            f"{current_metrics['C_om_fix']:.0f} €/an",
-        )
-    with colc3:
-        st.metric(
-            "Total C_Fuel",
-            f"{current_metrics['C_fuel']:.0f} €/an",
-        )
+    c4, c5, c6 = st.columns(3)
+    with c4:
+        st.metric("Total C_LOLE", f"{current_metrics['C_END']:.0f} €/an")
+    with c5:
+        st.metric("total present costs", f"{current_metrics['C_total']:.0f} €_2026")
+    with c6:
+        st.metric("System LCOE", f"{current_metrics['LCOE']:.1f} €_2026/MWh" if current_metrics["LCOE"] is not None else "n/a")
 
-    # Ligne 2 : Total C_LOLE, total present costs, System LCOE
-    colc4, colc5, colc6 = st.columns(3)
-    with colc4:
-        st.metric(
-            "Total C_LOLE",
-            f"{current_metrics['C_END']:.0f} €/an",
-        )
-    with colc5:
-        st.metric(
-            "total present costs",
-            f"{current_metrics['C_total']:.0f} €_2026",
-        )
-    with colc6:
-        st.metric(
-            "System LCOE",
-            f"{current_metrics['LCOE']:.1f} €_2026/MWh"
-            if current_metrics["LCOE"] is not None
-            else "n/a",
-        )
+    st.metric("CO2_Emissions", f"{current_metrics['CO2']:.0f} tCO2/an")
 
-    # CO2_Emissions (annuel)
-    st.metric(
-        "CO2_Emissions",
-        f"{current_metrics['CO2']:.0f} tCO2/an",
-    )
+    f1, f2 = st.columns(2)
+    with f1:
+        st.metric("Heures d'indisponibilité", f"{current_metrics['unavailability_hours']}")
+    with f2:
+        st.metric("END / demande", f"{current_metrics['END_ratio']*100:.3f} %")
 
-    st.markdown("### Indicateurs de fiabilité")
-
-    colf1, colf2 = st.columns(2)
-    with colf1:
-        st.metric(
-            "Heures d'indisponibilité par an",
-            f"{current_metrics['unavailability_hours']}",
-        )
-    with colf2:
-        st.metric(
-            "END / demande annuelle",
-            f"{current_metrics['END_ratio']*100:.3f} %",
-        )
-
-    st.markdown("### Capacités installées du scénario étudié")
+    st.markdown("### Capacités installées (solution)")
     st.write(current_caps)
 
     # ------------------------------- #
-    #   3️⃣bis BILAN ANNUEL ÉNERGIE    #
+    #   🧊 GALERIE HEATMAPS           #
+    # ------------------------------- #
+    if df_scenarios is not None and len(df_scenarios) > 0:
+        st.markdown("## 🧊 Galerie de heatmaps – coûts (toutes les vues utiles)")
+
+        show_only_feasible = st.checkbox(
+            "Afficher seulement les scénarios faisables (END_ratio ≤ contrainte)",
+            value=True,
+        )
+
+        df_hm = df_scenarios.copy()
+        if show_only_feasible:
+            df_hm = df_hm[df_hm["feasible"]].copy()
+
+        if len(df_hm) == 0:
+            st.warning("Aucun scénario à afficher avec ce filtre.")
+        else:
+            pairs = [
+                ("solar", "wind"),
+                ("solar", "diesel"),
+                ("wind", "diesel"),
+                ("solar", "bat_p"),
+                ("solar", "bat_e"),
+                ("wind", "bat_p"),
+                ("wind", "bat_e"),
+                ("diesel", "bat_p"),
+                ("diesel", "bat_e"),
+                ("bat_p", "bat_e"),
+            ]
+
+            st.subheader("Heatmaps – C_total (meilleur coût par case)")
+            for i in range(0, len(pairs), 2):
+                cols = st.columns(2)
+                for j in range(2):
+                    if i + j >= len(pairs):
+                        break
+                    x, y = pairs[i + j]
+                    df_cell = best_per_cell(df_hm, x, y, metric="C_total")
+                    with cols[j]:
+                        st.altair_chart(
+                            heatmap_rect(df_cell, x, y, z="C_total", title=f"C_total — {x} vs {y}"),
+                            use_container_width=True,
+                        )
+
+            with st.expander("Voir aussi les heatmaps de LCOE", expanded=False):
+                for i in range(0, len(pairs), 2):
+                    cols = st.columns(2)
+                    for j in range(2):
+                        if i + j >= len(pairs):
+                            break
+                        x, y = pairs[i + j]
+                        df_cell = best_per_cell(df_hm, x, y, metric="LCOE")
+                        with cols[j]:
+                            st.altair_chart(
+                                heatmap_rect(df_cell, x, y, z="LCOE", title=f"LCOE — {x} vs {y}"),
+                                use_container_width=True,
+                            )
+
+            with st.expander("Voir aussi les heatmaps de CO2", expanded=False):
+                for i in range(0, len(pairs), 2):
+                    cols = st.columns(2)
+                    for j in range(2):
+                        if i + j >= len(pairs):
+                            break
+                        x, y = pairs[i + j]
+                        df_cell = best_per_cell(df_hm, x, y, metric="CO2")
+                        with cols[j]:
+                            st.altair_chart(
+                                heatmap_rect(df_cell, x, y, z="CO2", title=f"CO2 — {x} vs {y}"),
+                                use_container_width=True,
+                            )
+
+            with st.expander("Table des scénarios (top 300 par coût)", expanded=False):
+                st.dataframe(df_scenarios.sort_values("C_total").head(300))
+
+    # ------------------------------- #
+    #   4️⃣ VISUS SYSTÈME             #
     # ------------------------------- #
 
-    st.markdown("## 📊 Bilan annuel d'utilisation par filière (MWh/an)")
-
-    T = len(current_ts)  # nb d'heures simulées
-    annualization_factor = 8760 / T  # annualisation si la simulation < 1 an
-
-    if T != 8760:
-        st.info(
-            f"Le profil contient {T} heures (pas un an complet). "
-            f"Les énergies sont annualisées via un facteur {annualization_factor:.2f}."
-        )
-    else:
-        st.caption("Profil annuel complet (8760 h) : pas d'annualisation.")
-
-    # Énergie “produite” (MWh/an) — dt = 1h
-    # Note : P_dis est l'énergie délivrée par la batterie (pas une source primaire).
-    annual_energy = {
-        "Solaire": float(current_ts["P_solar"].sum() * annualization_factor),
-        "Éolien": float(current_ts["P_wind"].sum() * annualization_factor),
-        "Diesel": float(current_ts["P_diesel"].sum() * annualization_factor),
-        "Batterie (décharge)": float(current_ts["P_dis"].sum() * annualization_factor),
-        "Énergie non servie (END)": float(current_ts["END"].sum() * annualization_factor),
-        "Surplus EnR (curtailment)": float(current_ts["Spill"].sum() * annualization_factor),
-    }
-
-    df_energy = (
-        pd.DataFrame({"Filière": list(annual_energy.keys()), "Énergie (MWh/an)": list(annual_energy.values())})
-        .sort_values("Énergie (MWh/an)", ascending=False)
-    )
-
-
-    # 2) Bar chart annuel
-    energy_bar = (
-        alt.Chart(df_energy)
-        .mark_bar()
-        .encode(
-            x=alt.X("Filière:N", sort="-y", title="Filière"),
-            y=alt.Y("Énergie (MWh/an):Q", title="Énergie (MWh/an)"),
-            tooltip=["Filière", alt.Tooltip("Énergie (MWh/an):Q", format=",.0f")],
-        )
-    )
-    st.altair_chart(energy_bar, use_container_width=True)
-
-    # 3) Part du mix (uniquement énergie SERVIE par filière “physique”)
-    # On exclut END et curtailment, et on exclut la batterie (car c'est un transfert).
-    served_sources = pd.DataFrame(
-        {
-            "Filière": ["Solaire", "Éolien", "Diesel"],
-            "Énergie (MWh/an)": [
-                annual_energy["Solaire"],
-                annual_energy["Éolien"],
-                annual_energy["Diesel"],
-            ],
-        }
-    )
-    served_total = served_sources["Énergie (MWh/an)"].sum()
-    if served_total > 0:
-        served_sources["Part (%)"] = 100 * served_sources["Énergie (MWh/an)"] / served_total
-
-        mix_pie = (
-            alt.Chart(served_sources)
-            .mark_arc()
-            .encode(
-                theta=alt.Theta("Énergie (MWh/an):Q"),
-                color=alt.Color("Filière:N", title="Filière"),
-                tooltip=["Filière", alt.Tooltip("Énergie (MWh/an):Q", format=",.0f"), alt.Tooltip("Part (%):Q", format=".1f")],
-            )
-        )
-        st.markdown("### Répartition du mix servi (Solaire/Éolien/Diesel)")
-        st.altair_chart(mix_pie, use_container_width=True)
-
-
-    # ------------------------------- #
-    #   4️⃣ COMPTE RENDU VISUEL       #
-    # ------------------------------- #
-
-    st.markdown("## 4️⃣ Compte rendu visuel du fonctionnement du système")
+    st.markdown("## 4️⃣ Compte rendu visuel du fonctionnement")
 
     st.subheader("Courbe de charge (48 premières heures)")
     n_show = min(48, len(current_ts))
     df_plot = current_ts.head(n_show).copy()
     df_plot["hour_idx"] = np.arange(len(df_plot))
-
     st.line_chart(df_plot.set_index("hour_idx")[["load"]])
 
     st.subheader("Production par filière (empilée, 48 premières heures)")
-
     df_prod = df_plot.rename(
         columns={
             "P_solar": "Solaire",
@@ -806,66 +843,43 @@ if current_metrics is not None and current_ts is not None and current_caps is no
             "P_diesel": "Diesel",
         }
     )
-
     prod = df_prod[["hour_idx", "Solaire", "Éolien", "Batterie (décharge)", "Diesel"]].melt(
-        id_vars="hour_idx",
-        var_name="Filière de production",
-        value_name="Puissance (MW)",
+        id_vars="hour_idx", var_name="Filière", value_name="Puissance (MW)"
     )
-
     chart = (
         alt.Chart(prod)
         .mark_area()
         .encode(
             x=alt.X("hour_idx:Q", title="Heure"),
             y=alt.Y("Puissance (MW):Q", stack="zero"),
-            color=alt.Color("Filière de production:N", title="Filière"),
-            tooltip=["hour_idx", "Filière de production", "Puissance (MW)"],
+            color=alt.Color("Filière:N", title="Filière"),
+            tooltip=["hour_idx", "Filière", "Puissance (MW)"],
         )
     )
-
     st.altair_chart(chart, use_container_width=True)
 
     st.subheader("Énergie non servie et surplus renouvelable (48 premières heures)")
-    df_end = df_plot.rename(
-        columns={"END": "Énergie non servie", "Spill": "Surplus EnR (curtailment)"}
-    )
-    st.line_chart(df_end.set_index("hour_idx")[["Énergie non servie", "Surplus EnR (curtailment)"]])
+    df_end = df_plot.rename(columns={"END": "Énergie non servie", "Spill": "Surplus EnR"})
+    st.line_chart(df_end.set_index("hour_idx")[["Énergie non servie", "Surplus EnR"]])
 
-    # ------------------------------- #
-    #   🔋 Analyse du fonctionnement de la batterie
-    # ------------------------------- #
-
-    st.markdown("## 🔋 Analyse du fonctionnement de la batterie (5 jours)")
-
-    # On limite l'affichage aux 5 premiers jours
+    st.markdown("## 🔋 Batterie (5 jours)")
     n_show_bat = min(5 * 24, len(current_ts))
     bat_plot = current_ts.head(n_show_bat).copy()
     bat_plot["hour_idx"] = np.arange(len(bat_plot))
-
-
-    # 1️⃣ Charge / décharge de la batterie
-    st.subheader("Puissance de charge / décharge de la batterie")
-
     bat_power = bat_plot[["hour_idx", "P_ch", "P_dis"]].melt(
-        id_vars="hour_idx",
-        var_name="Mode",
-        value_name="Puissance (MW)"
+        id_vars="hour_idx", var_name="Mode", value_name="Puissance (MW)"
     )
-
     bat_power_chart = (
         alt.Chart(bat_power)
         .mark_line()
         .encode(
             x="hour_idx",
             y="Puissance (MW)",
-            color=alt.Color("Mode:N", title="Mode batterie"),
-            tooltip=["hour_idx", "Mode", "Puissance (MW)"]
+            color=alt.Color("Mode:N", title="Mode"),
+            tooltip=["hour_idx", "Mode", "Puissance (MW)"],
         )
     )
-
     st.altair_chart(bat_power_chart, use_container_width=True)
 
-
 else:
-    st.info("➡️ Définis un scénario ou lance une optimisation pour afficher les indicateurs et les graphiques.")
+    st.info("➡️ Lance une simulation (scénario) ou une optimisation pour afficher les résultats.")
