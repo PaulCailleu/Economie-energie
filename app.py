@@ -647,17 +647,17 @@ else:
         solar_rng = st.slider("Solaire (MW) – plage", 0.0, 250.0, (0.0, 20.0), 1.0)
         solar_step = st.slider("Solaire – pas (MW)", 1.0, 50.0, 5.0, 1.0)
 
-        wind_rng = st.slider("Éolien (MW) – plage", 0.0, 200.0, (0.0, 30.0), 1.0)
+        wind_rng = st.slider("Éolien (MW) – plage", 0.0, 300.0, (0.0, 30.0), 1.0)
         wind_step = st.slider("Éolien – pas (MW)", 1.0, 50.0, 5.0, 1.0)
 
         diesel_rng = st.slider("Diesel (MW) – plage", 0.0, 200.0, (8.0, 24.0), 1.0)
         diesel_step = st.slider("Diesel – pas (MW)", 1.0, 50.0, 4.0, 1.0)
 
     with c2:
-        bat_p_rng = st.slider("Batterie P (MW) – plage", 0.0, 80.0, (0.0, 4.0), 0.5)
+        bat_p_rng = st.slider("Batterie P (MW) – plage", 0.0, 24.0, (0.0, 4.0), 0.5)
         bat_p_step = st.slider("Batterie P – pas (MW)", 0.5, 20.0, 2.0, 0.5)
 
-        bat_e_rng = st.slider("Batterie E (MWh) – plage", 0.0, 300.0, (0.0, 8.0), 1.0)
+        bat_e_rng = st.slider("Batterie E (MWh) – plage", 0.0, 1000.0, (0.0, 8.0), 1.0)
         bat_e_step = st.slider("Batterie E – pas (MWh)", 1.0, 80.0, 4.0, 1.0)
 
     st.markdown("### Accélération coarse → refine")
